@@ -1,0 +1,316 @@
+Clover Revolution (Roblox, Luau) - code sample
+Author: Kukicrumblez  kukicrumblez@gmail.com
+
+300 lines
+
+================================================================================
+1. src/shared/Attributes.luau
+================================================================================
+--!strict
+-- Physical attributes: upgradable stats (health, mana, regen, damage, crit...).
+-- Points: 3 to start + 1 per player level + 5 per prestige. Each stat caps at MaxPerStat. Free reset.
+-- Effects use the same mod keys as loot/families (CombatService caps damage stacking). On the five-leaf Null Blade,
+-- Mana Pool / Mana Flow boost stamina instead (stamina lives in the mana pool).
+
+local Attributes = {}
+
+export type Attr = { id: string, name: string, color: Color3, desc: string, key: string, per: number, pct: boolean }
+
+Attributes.List = {
+	{ id = "vitality", name = "VITALITY", color = Color3.fromRGB(255, 92, 92), desc = "Max Health", key = "maxHealth", per = 5, pct = false },
+	{ id = "spirit", name = "MANA POOL", color = Color3.fromRGB(110, 160, 255), desc = "Max Mana / Stamina", key = "maxMana", per = 5, pct = false },
+	{ id = "flow", name = "MANA FLOW", color = Color3.fromRGB(90, 220, 255), desc = "Mana / Stamina regen (small steps)", key = "manaRegenMul", per = 0.02, pct = true }, -- design: regen only goes up in small steps
+	{ id = "strength", name = "STRENGTH", color = Color3.fromRGB(255, 150, 60), desc = "All damage", key = "allDamageMul", per = 0.01, pct = true },
+	{ id = "focus", name = "FOCUS", color = Color3.fromRGB(190, 120, 255), desc = "Spell damage", key = "spellDamageMul", per = 0.015, pct = true },
+	{ id = "toughness", name = "TOUGHNESS", color = Color3.fromRGB(200, 180, 140), desc = "Damage taken reduced", key = "damageTakenCut", per = 0.01, pct = true },
+	{ id = "agility", name = "AGILITY", color = Color3.fromRGB(120, 235, 140), desc = "Dash recharge", key = "dashRechargeMul", per = 0.03, pct = true },
+	{ id = "precision", name = "PRECISION", color = Color3.fromRGB(255, 220, 90), desc = "Crit chance", key = "critChance", per = 0.005, pct = true },
+} :: { Attr }
+
+Attributes.Defs = {} :: { [string]: Attr }
+for _, a in Attributes.List do
+	Attributes.Defs[a.id] = a
+end
+
+Attributes.MaxPerStat = 15
+Attributes.StartPoints = 3
+Attributes.PerLevel = 1
+Attributes.PerPrestige = 5
+
+-- `bonus`: extra points earned from Grimoire Essence (salvaged grimoires)
+function Attributes.totalPoints(level: number?, prestige: number?, bonus: number?): number
+	return Attributes.StartPoints + Attributes.PerLevel * math.max(0, (level or 1) - 1) + Attributes.PerPrestige * (prestige or 0) + (bonus or 0)
+end
+
+function Attributes.spent(alloc: { [string]: number }?): number
+	local n = 0
+	for _, v in alloc or {} do
+		n += v
+	end
+	return n
+end
+
+function Attributes.mods(alloc: { [string]: number }?): { [string]: number }
+	local out = {}
+	for id, pts in alloc or {} do
+		local a = Attributes.Defs[id]
+		if a and pts > 0 then
+			out[a.key] = (out[a.key] or 0) + a.per * math.min(pts, Attributes.MaxPerStat)
+		end
+	end
+	return out
+end
+
+-- "+25" / "+12%" for n points
+function Attributes.fmt(a: Attr, pts: number): string
+	local v = a.per * pts
+	return if a.pct then ("+%s%%"):format(tostring(math.floor(v * 1000 + 0.5) / 10)) else ("+%d"):format(math.floor(v + 0.5))
+end
+
+return Attributes
+
+================================================================================
+2. src/server/AttributeService.luau
+================================================================================
+--!strict
+-- Attribute points (server). GetAttributes() · SpendAttribute(id) → +1 point · ResetAttributes() (free).
+-- Allocation lives in data.attributes = { [id] = points }. Mods are merged with the family mods at combat arm time.
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Shared = ReplicatedStorage.Shared
+local Net = require(Shared.Net)
+local Attributes = require(Shared.Attributes)
+local PlayerData = require(script.Parent.PlayerDataService)
+local RateLimit = require(script.Parent.RateLimit)
+
+local AttributeService = {}
+
+local Config = require(Shared.Config)
+
+-- extra attribute points from Grimoire Essence (salvaged grimoires)
+local function bonus(data: any): number
+	return math.min(Config.MaxEssencePoints, math.floor((data.essence or 0) / Config.EssencePerPoint))
+end
+AttributeService.bonusPoints = bonus
+
+local function alloc(data: any): { [string]: number }
+	data.attributes = data.attributes or {}
+	-- level dropped (prestige reset)? refund everything rather than keep an over-spent build
+	if Attributes.spent(data.attributes) > Attributes.totalPoints(data.level, data.prestige, bonus(data)) then
+		data.attributes = {}
+	end
+	return data.attributes
+end
+
+local function snapshot(data: any): any
+	local a = alloc(data)
+	local total = Attributes.totalPoints(data.level, data.prestige, bonus(data))
+	return { alloc = a, total = total, free = total - Attributes.spent(a), max = Attributes.MaxPerStat,
+		essence = data.essence or 0, essencePer = Config.EssencePerPoint, essencePoints = bonus(data), essenceMax = Config.MaxEssencePoints }
+end
+
+function AttributeService.mods(data: any): { [string]: number }
+	return if data then Attributes.mods(alloc(data)) else {}
+end
+
+-- family + attribute mods merged (what CombatService.enable receives as familyMods)
+function AttributeService.withFamily(data: any): { [string]: number }
+	local out = table.clone((require(script.Parent.FamilyService).mods(data)))
+	for k, v in AttributeService.mods(data) do
+		out[k] = (out[k] or 0) + v
+	end
+	-- equipped grimoire: more leaves = more damage and a bigger mana pool (Config.LeafPower)
+	local ok, book = pcall(function()
+		return require(script.Parent.GrimoireService).equipped(data)
+	end)
+	local lp = ok and book and Config.LeafPower[book.leaves]
+	if lp then
+		out.grimoireDamageMul = (out.grimoireDamageMul or 0) + lp.damage
+		out.maxMana = (out.maxMana or 0) + lp.mana
+	end
+	return out
+end
+
+function AttributeService.start()
+	Net.fn("GetAttributes").OnServerInvoke = function(player)
+		local data = PlayerData.get(player)
+		return data and snapshot(data) or nil
+	end
+	Net.fn("SpendAttribute").OnServerInvoke = function(player, id)
+		if not RateLimit.allow(player, "SpendAttribute", 0.12) then
+			return false, "Slow down"
+		end
+		local data = PlayerData.get(player)
+		if not data or data._readOnly then
+			return false, "Not loaded"
+		end
+		if typeof(id) ~= "string" or not Attributes.Defs[id] then
+			return false, "Unknown attribute"
+		end
+		if player:GetAttribute("InMission") then
+			return false, "Spend points outside missions"
+		end
+		local s = snapshot(data)
+		if s.free <= 0 then
+			return false, "No points left — level up for more"
+		end
+		local a = alloc(data)
+		if (a[id] or 0) >= Attributes.MaxPerStat then
+			return false, "That attribute is maxed"
+		end
+		a[id] = (a[id] or 0) + 1
+		return true, nil, snapshot(data)
+	end
+	Net.fn("ResetAttributes").OnServerInvoke = function(player)
+		if not RateLimit.allow(player, "ResetAttributes", 1) then
+			return false, "Slow down"
+		end
+		local data = PlayerData.get(player)
+		if not data or data._readOnly or player:GetAttribute("InMission") then
+			return false, "Not now"
+		end
+		data.attributes = {}
+		return true, nil, snapshot(data)
+	end
+end
+
+return AttributeService
+
+================================================================================
+3. src/client/Combat/Movement.luau
+================================================================================
+--!strict
+-- Magic Dash + dodge on the client (Roblox characters are client-simulated). The server tracks charges,
+-- cooldowns and i-frames; the client mirrors them so the move feels instant.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local CC = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("CombatConfig"))
+local M = CC.Movement
+
+local Movement = {}
+
+local localCharges = M.dashCharges
+local lastDodge = -99
+local airDashes = 0
+local busyUntil = 0
+
+function Movement.sync(serverCharges: number)
+	localCharges = serverCharges
+end
+
+local function char(): (Model?, BasePart?, Humanoid?)
+	local c = Players.LocalPlayer.Character
+	local r = c and c:FindFirstChild("HumanoidRootPart") :: BasePart?
+	local h = c and c:FindFirstChildOfClass("Humanoid")
+	return c, r, h
+end
+
+local function moveDir(r: BasePart, h: Humanoid): Vector3
+	local d = h.MoveDirection
+	if d.Magnitude < 0.1 then
+		local look = Workspace.CurrentCamera.CFrame.LookVector * Vector3.new(1, 0, 1)
+		d = if look.Magnitude > 0.1 then look.Unit else r.CFrame.LookVector
+	end
+	return d.Unit
+end
+
+local function impulse(r: BasePart, velocity: Vector3, duration: number, keepY: boolean)
+	local att = Instance.new("Attachment")
+	att.Parent = r
+	local lv = Instance.new("LinearVelocity")
+	lv.Attachment0 = att
+	lv.MaxForce = math.huge
+	lv.RelativeTo = Enum.ActuatorRelativeTo.World
+	lv.VelocityConstraintMode = if keepY then Enum.VelocityConstraintMode.Plane else Enum.VelocityConstraintMode.Vector
+	if keepY then
+		lv.PrimaryTangentAxis = Vector3.xAxis
+		lv.SecondaryTangentAxis = Vector3.zAxis
+		lv.PlaneVelocity = Vector2.new(velocity.X, velocity.Z)
+	else
+		lv.VectorVelocity = velocity
+	end
+	lv.Parent = r
+	-- Smooth movement: full speed for the first 60%, then ease out (no dead stop);
+	-- a bit of the momentum carries into normal movement
+	local t0 = os.clock()
+	local conn: RBXScriptConnection
+	conn = game:GetService("RunService").Heartbeat:Connect(function()
+		local t = (os.clock() - t0) / duration
+		if t >= 1 or not lv.Parent then
+			conn:Disconnect()
+			if lv.Parent and r.Parent then
+				local v = r.AssemblyLinearVelocity
+				r.AssemblyLinearVelocity = Vector3.new(velocity.X * 0.25, math.min(v.Y, if keepY then 4 else 10), velocity.Z * 0.25)
+			end
+			lv:Destroy()
+			att:Destroy()
+			return
+		end
+		local k = if t < 0.6 then 1 else 1 - ((t - 0.6) / 0.4) ^ 2 * 0.75
+		-- Bug fix: a ground dash at this speed used to ramp off
+		-- slopes, steps and enemies. Ground dashes never keep upward speed.
+		if keepY then
+			local v = r.AssemblyLinearVelocity
+			if v.Y > 4 then
+				r.AssemblyLinearVelocity = Vector3.new(v.X, 4, v.Z)
+			end
+		end
+		if keepY then
+			lv.PlaneVelocity = Vector2.new(velocity.X * k, velocity.Z * k)
+		else
+			lv.VectorVelocity = velocity * k
+		end
+	end)
+end
+
+-- Returns true if a dash happened (so the caller can tell the server + play effects).
+function Movement.dash(): boolean
+	local _, r, h = char()
+	if not r or not h or h.Health <= 0 or localCharges <= 0 or os.clock() < busyUntil then
+		return false
+	end
+	local airborne = h.FloorMaterial == Enum.Material.Air
+	if airborne then
+		if airDashes >= M.airDashes then
+			return false
+		end
+		airDashes += 1
+	end
+	localCharges -= 1
+	busyUntil = os.clock() + M.dashTime * 0.6
+	local d = moveDir(r, h)
+	-- airborne dashes keep a slight lift so aerial repositioning feels good
+	impulse(r, d * M.dashSpeed + (if airborne then Vector3.new(0, 6, 0) else Vector3.zero), M.dashTime, not airborne)
+	return true
+end
+
+function Movement.dodge(): boolean
+	local _, r, h = char()
+	if not r or not h or h.Health <= 0 or os.clock() - lastDodge < M.dodgeCooldown or os.clock() < busyUntil then
+		return false
+	end
+	lastDodge = os.clock()
+	busyUntil = os.clock() + M.dodgeTime
+	local d = moveDir(r, h)
+	if h.MoveDirection.Magnitude < 0.1 then
+		d = -r.CFrame.LookVector * Vector3.new(1, 0, 1) -- standing still: hop backwards
+		d = d.Unit
+	end
+	impulse(r, d * M.dodgeSpeed, M.dodgeTime, true)
+	return true
+end
+
+function Movement.landed()
+	airDashes = 0
+end
+
+function Movement.reset()
+	localCharges = M.dashCharges
+	airDashes = 0
+	lastDodge = -99
+	busyUntil = 0
+end
+
+return Movement
